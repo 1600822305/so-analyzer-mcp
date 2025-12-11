@@ -49,6 +49,23 @@ from .decompile_utils import (
     check_radare2,
     decompile
 )
+from .patch_advanced import (
+    patch_return_value,
+    patch_nop,
+    patch_branch,
+    patch_custom,
+    find_vip_functions,
+    generate_patch_script,
+    get_patch_templates
+)
+from .flutter_libapp import (
+    check_blutter,
+    analyze_libapp_with_blutter,
+    extract_dart_symbols,
+    generate_flutter_hook_script,
+    analyze_flutter_apk,
+    find_flutter_vip_functions
+)
 
 # 创建MCP服务器
 server = Server("so-analyzer")
@@ -472,6 +489,157 @@ def get_all_tools() -> list[Tool]:
                 },
                 "required": ["so_path", "pattern"]
             }
+        ),
+        
+        # ===== 高级Patch工具 =====
+        Tool(
+            name="so_patch_return",
+            description="⭐修改函数直接返回指定值(VIP破解核心工具)。支持:0/1/true/false/-1/max/自定义数值",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "函数地址（虚拟地址）"},
+                    "return_value": {"type": ["integer", "string"], "description": "返回值:0/1/true/false/-1/max/数字"},
+                    "output_path": {"type": "string", "description": "输出路径（可选，默认覆盖原文件）"}
+                },
+                "required": ["so_path", "address"]
+            }
+        ),
+        Tool(
+            name="so_patch_nop",
+            description="将指令替换为NOP(空操作)，用于跳过检测代码",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "起始地址（虚拟地址）"},
+                    "count": {"type": "integer", "description": "NOP数量（每个4字节，默认1）"},
+                    "output_path": {"type": "string", "description": "输出路径（可选）"}
+                },
+                "required": ["so_path", "address"]
+            }
+        ),
+        Tool(
+            name="so_patch_branch",
+            description="修改分支跳转指令。force_jump=强制跳转/no_jump=不跳转/invert=反转条件",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "分支指令地址"},
+                    "patch_type": {"type": "string", "description": "类型:force_jump/no_jump/invert"},
+                    "output_path": {"type": "string", "description": "输出路径（可选）"}
+                },
+                "required": ["so_path", "address", "patch_type"]
+            }
+        ),
+        Tool(
+            name="so_patch_hex",
+            description="自定义Patch-直接写入十六进制字节（高级用户）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "目标地址"},
+                    "hex_bytes": {"type": "string", "description": "十六进制字节(如20008052C0035FD6)"},
+                    "output_path": {"type": "string", "description": "输出路径（可选）"}
+                },
+                "required": ["so_path", "address", "hex_bytes"]
+            }
+        ),
+        Tool(
+            name="so_find_vip",
+            description="⭐自动查找VIP/会员验证函数（isVip/isPremium/checkLicense等）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "自定义关键词（可选）"},
+                    "limit": {"type": "integer", "description": "最大返回数量（默认50）"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        Tool(
+            name="so_patch_templates",
+            description="获取所有预设Patch模板(return_true/return_false/nop/infinite_value等)",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        
+        # ===== Flutter libapp.so 分析 =====
+        Tool(
+            name="flutter_check_blutter",
+            description="检查Blutter环境是否可用（用于分析libapp.so）",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="flutter_analyze_libapp",
+            description="⭐使用Blutter分析libapp.so，恢复Dart符号和函数（核心工具）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lib_dir": {"type": "string", "description": "包含libapp.so的目录(如lib/arm64-v8a)"},
+                    "output_dir": {"type": "string", "description": "输出目录（可选）"},
+                    "rebuild": {"type": "boolean", "description": "是否重新编译Blutter（默认false）"}
+                },
+                "required": ["lib_dir"]
+            }
+        ),
+        Tool(
+            name="flutter_extract_strings",
+            description="从libapp.so提取字符串和包名（无需Blutter）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "libapp_path": {"type": "string", "description": "libapp.so文件路径"}
+                },
+                "required": ["libapp_path"]
+            }
+        ),
+        Tool(
+            name="flutter_generate_hook",
+            description="生成Flutter Frida Hook脚本。类型:trace/modify/args",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbols": {"type": "array", "description": "符号列表（来自flutter_analyze_libapp）"},
+                    "hook_type": {"type": "string", "description": "类型:trace(追踪)/modify(修改返回值)/args(打印参数)"},
+                    "filter_pattern": {"type": "string", "description": "过滤模式（正则表达式，可选）"}
+                },
+                "required": ["symbols"]
+            }
+        ),
+        Tool(
+            name="flutter_analyze_apk",
+            description="⭐完整分析Flutter APK：解压→提取SO→Blutter分析→生成Hook脚本",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "apk_path": {"type": "string", "description": "APK文件路径"},
+                    "output_dir": {"type": "string", "description": "输出目录（可选）"},
+                    "use_blutter": {"type": "boolean", "description": "是否使用Blutter（默认true）"}
+                },
+                "required": ["apk_path"]
+            }
+        ),
+        Tool(
+            name="flutter_find_vip",
+            description="⭐在Flutter libapp.so中查找VIP/会员相关函数",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "libapp_path": {"type": "string", "description": "libapp.so文件路径"},
+                    "blutter_output_dir": {"type": "string", "description": "Blutter输出目录（可选，如果已分析过）"}
+                },
+                "required": ["libapp_path"]
+            }
         )
     ]
 
@@ -689,6 +857,85 @@ async def call_tool(name: str, arguments: dict):
                 pattern=arguments["pattern"],
                 operand_filter=arguments.get("operand_filter", ""),
                 limit=arguments.get("limit", 100)
+            )
+        
+        # 高级Patch工具
+        elif name == "so_patch_return":
+            result = patch_return_value(
+                so_path=arguments["so_path"],
+                address=arguments["address"],
+                return_value=arguments.get("return_value", 1),
+                output_path=arguments.get("output_path")
+            )
+        
+        elif name == "so_patch_nop":
+            result = patch_nop(
+                so_path=arguments["so_path"],
+                address=arguments["address"],
+                count=arguments.get("count", 1),
+                output_path=arguments.get("output_path")
+            )
+        
+        elif name == "so_patch_branch":
+            result = patch_branch(
+                so_path=arguments["so_path"],
+                address=arguments["address"],
+                patch_type=arguments["patch_type"],
+                output_path=arguments.get("output_path")
+            )
+        
+        elif name == "so_patch_hex":
+            result = patch_custom(
+                so_path=arguments["so_path"],
+                address=arguments["address"],
+                hex_bytes=arguments["hex_bytes"],
+                output_path=arguments.get("output_path")
+            )
+        
+        elif name == "so_find_vip":
+            result = find_vip_functions(
+                so_path=arguments["so_path"],
+                keywords=arguments.get("keywords"),
+                limit=arguments.get("limit", 50)
+            )
+        
+        elif name == "so_patch_templates":
+            result = get_patch_templates()
+        
+        # Flutter libapp.so 分析
+        elif name == "flutter_check_blutter":
+            result = check_blutter()
+        
+        elif name == "flutter_analyze_libapp":
+            result = analyze_libapp_with_blutter(
+                lib_dir=arguments["lib_dir"],
+                output_dir=arguments.get("output_dir"),
+                rebuild=arguments.get("rebuild", False)
+            )
+        
+        elif name == "flutter_extract_strings":
+            result = extract_dart_symbols(
+                libapp_path=arguments["libapp_path"]
+            )
+        
+        elif name == "flutter_generate_hook":
+            result = generate_flutter_hook_script(
+                symbols=arguments["symbols"],
+                hook_type=arguments.get("hook_type", "trace"),
+                filter_pattern=arguments.get("filter_pattern", "")
+            )
+        
+        elif name == "flutter_analyze_apk":
+            result = analyze_flutter_apk(
+                apk_path=arguments["apk_path"],
+                output_dir=arguments.get("output_dir"),
+                use_blutter=arguments.get("use_blutter", True)
+            )
+        
+        elif name == "flutter_find_vip":
+            result = find_flutter_vip_functions(
+                libapp_path=arguments["libapp_path"],
+                blutter_output_dir=arguments.get("blutter_output_dir")
             )
         
         else:
