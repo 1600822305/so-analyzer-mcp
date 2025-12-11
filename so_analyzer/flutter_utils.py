@@ -4,14 +4,355 @@ import re
 import zipfile
 import tempfile
 import shutil
+import struct
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
+from .flutter_utils_v2 import find_ssl_verify_function_v2, vaddr_to_file_offset
 
 try:
     import lief
     LIEF_AVAILABLE = True
 except ImportError:
     LIEF_AVAILABLE = False
+
+
+def find_ssl_verify_offset(so_path: str) -> dict:
+    """
+    使用正确的方法定位Flutter SSL验证函数
+    
+    策略：
+    1. 找到JNI_OnLoad导出函数地址
+    2. 搜索"ssl_client"和"ssl_server"字符串
+    3. 通过字符串交叉引用找到ssl_crypto_x509_session_verify_cert_chain函数
+    4. 计算与JNI_OnLoad的偏移
+    
+    Args:
+        so_path: libflutter.so文件路径
+    
+    Returns:
+        dict: {"success": bool, "offset": int, "jni_onload": int, "ssl_verify": int, "error": str}
+    """
+    if not LIEF_AVAILABLE:
+        return {"success": False, "error": "lief not available"}
+    
+    if not os.path.exists(so_path):
+        return {"success": False, "error": f"File not found: {so_path}"}
+    
+    try:
+        with open(so_path, 'rb') as f:
+            data = f.read()
+        
+        binary = lief.parse(so_path)
+        if binary is None:
+            return {"success": False, "error": "Failed to parse SO file"}
+        
+        result = {
+            "success": False,
+            "jni_onload_address": None,
+            "ssl_verify_address": None,
+            "offset_from_jni_onload": None,
+            "ssl_client_offset": None,
+            "ssl_server_offset": None,
+            "frida_script_hint": None,
+            "error": ""
+        }
+        
+        # 1. 找JNI_OnLoad地址
+        jni_onload_addr = None
+        for func in binary.exported_functions:
+            name = func.name if hasattr(func, 'name') else ""
+            if "JNI_OnLoad" in name:
+                jni_onload_addr = func.address
+                result["jni_onload_address"] = hex(jni_onload_addr)
+                break
+        
+        if jni_onload_addr is None:
+            result["error"] = "JNI_OnLoad not found in exports"
+            return result
+        
+        # 2. 搜索关键字符串
+        ssl_client_offset = data.find(b"ssl_client\x00")
+        ssl_server_offset = data.find(b"ssl_server\x00")
+        
+        result["ssl_client_offset"] = hex(ssl_client_offset) if ssl_client_offset != -1 else None
+        result["ssl_server_offset"] = hex(ssl_server_offset) if ssl_server_offset != -1 else None
+        
+        if ssl_client_offset == -1 or ssl_server_offset == -1:
+            result["error"] = "ssl_client or ssl_server string not found"
+            return result
+        
+        # 3. 获取段信息用于地址计算
+        text_section = None
+        rodata_section = None
+        
+        for section in binary.sections:
+            if section.name == ".text":
+                text_section = section
+            elif section.name == ".rodata":
+                rodata_section = section
+        
+        if text_section is None:
+            result["error"] = ".text section not found"
+            return result
+        
+        # 4. 计算字符串的虚拟地址
+        # 需要找到字符串所在段并计算虚拟地址
+        ssl_client_vaddr = ssl_client_offset
+        ssl_server_vaddr = ssl_server_offset
+        
+        if rodata_section:
+            # 检查字符串是否在.rodata段
+            if rodata_section.file_offset <= ssl_client_offset < rodata_section.file_offset + rodata_section.size:
+                ssl_client_vaddr = rodata_section.virtual_address + (ssl_client_offset - rodata_section.file_offset)
+            if rodata_section.file_offset <= ssl_server_offset < rodata_section.file_offset + rodata_section.size:
+                ssl_server_vaddr = rodata_section.virtual_address + (ssl_server_offset - rodata_section.file_offset)
+        
+        result["ssl_client_vaddr"] = hex(ssl_client_vaddr)
+        result["ssl_server_vaddr"] = hex(ssl_server_vaddr)
+        
+        # 5. 在.text段搜索同时引用这两个字符串的函数
+        text_start = text_section.file_offset
+        text_end = text_section.file_offset + text_section.size
+        text_vaddr = text_section.virtual_address
+        
+        # 搜索引用ssl_client的代码位置
+        ssl_client_refs = find_string_references(data, text_start, text_end, text_vaddr, ssl_client_vaddr)
+        ssl_server_refs = find_string_references(data, text_start, text_end, text_vaddr, ssl_server_vaddr)
+        
+        result["ssl_client_refs_count"] = len(ssl_client_refs)
+        result["ssl_server_refs_count"] = len(ssl_server_refs)
+        
+        # 6. 收集所有候选函数
+        candidates = []
+        seen_funcs = set()
+        
+        # 收集所有ssl_client引用的函数
+        for ref in ssl_client_refs:
+            ref_file_offset = ref - text_vaddr + text_start
+            func_start = find_function_start(data, text_start, ref_file_offset)
+            if func_start and func_start not in seen_funcs:
+                seen_funcs.add(func_start)
+                func_vaddr = text_vaddr + (func_start - text_start)
+                # 检查这个函数是否也引用了ssl_server
+                refs_ssl_server = any(abs(ref - srv) < 0x1000 for srv in ssl_server_refs)
+                candidates.append({
+                    "address": hex(func_vaddr),
+                    "file_offset": hex(func_start),
+                    "refs_both": refs_ssl_server,
+                    "client_ref_at": hex(ref),
+                    "offset_from_jni": hex(func_vaddr - jni_onload_addr)
+                })
+        
+        # 收集所有ssl_server引用的函数
+        for ref in ssl_server_refs:
+            ref_file_offset = ref - text_vaddr + text_start
+            func_start = find_function_start(data, text_start, ref_file_offset)
+            if func_start and func_start not in seen_funcs:
+                seen_funcs.add(func_start)
+                func_vaddr = text_vaddr + (func_start - text_start)
+                refs_ssl_client = any(abs(ref - cli) < 0x1000 for cli in ssl_client_refs)
+                candidates.append({
+                    "address": hex(func_vaddr),
+                    "file_offset": hex(func_start),
+                    "refs_both": refs_ssl_client,
+                    "server_ref_at": hex(ref),
+                    "offset_from_jni": hex(func_vaddr - jni_onload_addr)
+                })
+        
+        # 按地址排序
+        candidates.sort(key=lambda x: int(x["address"], 16))
+        
+        # 分析每个候选函数的特征
+        for cand in candidates:
+            func_file_offset = int(cand["file_offset"], 16)
+            func_size = estimate_function_size(data, func_file_offset, text_end)
+            cand["estimated_size"] = func_size
+            
+            # 计算置信度
+            confidence = 0.5
+            if cand["refs_both"]:
+                confidence += 0.3  # 同时引用两个字符串
+            
+            # 函数大小评分 - SSL验证函数通常在300-800字节
+            if 300 <= func_size <= 800:
+                confidence += 0.25  # 最佳大小范围
+            elif 200 < func_size < 1200:
+                confidence += 0.15  # 可接受大小
+            elif func_size > 1200:
+                confidence -= 0.1  # 函数较大，可能是封装函数
+            elif func_size < 200:
+                confidence -= 0.1  # 函数太小
+            
+            cand["confidence"] = round(confidence, 2)
+        
+        # 按置信度排序，置信度相同时优先选择大小更接近500的
+        ideal_size = 500
+        candidates.sort(key=lambda x: (-x["confidence"], abs(x["estimated_size"] - ideal_size)))
+        
+        result["candidates"] = candidates
+        result["candidates_count"] = len(candidates)
+        
+        # 选择最佳候选
+        if candidates:
+            best = candidates[0]
+            result["recommended"] = best["address"]
+            result["recommended_offset"] = best["offset_from_jni"]
+            result["recommended_confidence"] = best["confidence"]
+            
+            # 生成Frida脚本
+            offset_hex = best["offset_from_jni"]
+            result["frida_script"] = f"""// Frida SSL Bypass 脚本
+// 推荐地址: {best["address"]} (置信度: {best["confidence"]})
+
+function hook_ssl_verify() {{
+    var m = Process.findModuleByName("libflutter.so");
+    var jni_onload = m.enumerateExports().find(e => e.name === "JNI_OnLoad").address;
+    
+    // 推荐的偏移
+    var ssl_verify = ptr(jni_onload).add({offset_hex});
+    console.log("Hooking SSL verify at: " + ssl_verify);
+    
+    Interceptor.attach(ssl_verify, {{
+        onEnter: function(args) {{
+            console.log("SSL verify called");
+        }},
+        onLeave: function(retval) {{
+            console.log("Original return: " + retval);
+            retval.replace(0x1);
+            console.log("Bypassed! Return: 1");
+        }}
+    }});
+}}
+
+// 如果推荐地址不对，尝试其他候选:
+// {chr(10).join([f"// - {c['address']} (置信度: {c['confidence']}, 偏移: {c['offset_from_jni']})" for c in candidates[:5]])}
+
+setTimeout(hook_ssl_verify, 1000);
+"""
+        else:
+            result["error"] = "No candidate functions found"
+            return result
+        
+        result["success"] = True
+        return result
+        
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": f"{str(e)}\n{traceback.format_exc()}"}
+
+
+def find_string_references(data: bytes, text_start: int, text_end: int, text_vaddr: int, string_vaddr: int) -> list:
+    """
+    在.text段中搜索引用指定虚拟地址的代码
+    
+    搜索ADRP + ADD/LDR模式
+    """
+    refs = []
+    target_page = string_vaddr & ~0xFFF
+    target_offset = string_vaddr & 0xFFF
+    
+    for file_offset in range(text_start, min(text_end, len(data) - 8), 4):
+        insn = struct.unpack('<I', data[file_offset:file_offset+4])[0]
+        
+        # 检查ADRP指令
+        if (insn & 0x9F000000) == 0x90000000:
+            # 提取立即数
+            immlo = (insn >> 29) & 0x3
+            immhi = (insn >> 5) & 0x7FFFF
+            imm = (immhi << 2) | immlo
+            
+            # 符号扩展
+            if imm & 0x100000:
+                imm = imm - 0x200000
+            
+            # 计算目标页
+            current_vaddr = text_vaddr + (file_offset - text_start)
+            pc_page = current_vaddr & ~0xFFF
+            adrp_target = (pc_page + (imm << 12)) & 0xFFFFFFFFFFFFFFFF
+            
+            # 检查是否指向目标页
+            if adrp_target == target_page:
+                # 检查下一条ADD指令
+                if file_offset + 4 < len(data):
+                    next_insn = struct.unpack('<I', data[file_offset+4:file_offset+8])[0]
+                    # ADD immediate (32位或64位)
+                    if (next_insn & 0x7F800000) == 0x11000000 or (next_insn & 0xFF800000) == 0x91000000:
+                        add_imm = (next_insn >> 10) & 0xFFF
+                        if add_imm == target_offset:
+                            refs.append(current_vaddr)
+    
+    return refs
+
+
+def find_function_start(data: bytes, text_start: int, ref_offset: int) -> Optional[int]:
+    """
+    从引用位置向前搜索函数开头
+    
+    ARM64函数开头特征:
+    - STP X29, X30, [SP, #-N]!  (常见)
+    - PACIBSP (PAC指令)
+    - SUB SP, SP, #N
+    """
+    # 向前搜索最多4KB
+    search_start = max(text_start, ref_offset - 4096)
+    
+    # 从ref_offset向前搜索
+    for offset in range(ref_offset, search_start, -4):
+        if offset < 4:
+            break
+        
+        insn = struct.unpack('<I', data[offset:offset+4])[0]
+        
+        # PACIBSP: 0xD503237F
+        if insn == 0xD503237F:
+            return offset
+        
+        # STP X29, X30, [SP, #imm]! - 函数入口常见模式
+        # 编码: 101_0100_11_0_xxxxxxx_11110_11101_11111
+        # 简化检查: (insn & 0xFFE003FF) == 0xA98003E0 表示 STP X29, X30
+        if (insn & 0xFFC003FF) == 0xA98003E0:
+            return offset
+        
+        # SUB SP, SP, #imm (64位)
+        # 编码: 1101_0001_00_xxxxxxxxxxxx_11111_11111
+        if (insn & 0xFF0003FF) == 0xD10003FF:
+            return offset
+    
+    return None
+
+
+def estimate_function_size(data: bytes, func_start: int, text_end: int) -> int:
+    """
+    估算函数大小
+    
+    通过查找RET指令或下一个函数开头来估算
+    """
+    max_search = min(func_start + 0x10000, text_end)  # 最多搜索64KB
+    
+    for offset in range(func_start + 4, max_search, 4):
+        if offset + 4 > len(data):
+            break
+        
+        insn = struct.unpack('<I', data[offset:offset+4])[0]
+        
+        # RET指令: 0xD65F03C0
+        if insn == 0xD65F03C0:
+            return offset - func_start + 4
+        
+        # 遇到下一个函数开头
+        # PACIBSP
+        if insn == 0xD503237F:
+            return offset - func_start
+        
+        # STP X29, X30
+        if (insn & 0xFFC003FF) == 0xA98003E0:
+            # 检查前一条是否是RET或NOP
+            if offset >= 4:
+                prev_insn = struct.unpack('<I', data[offset-4:offset])[0]
+                if prev_insn == 0xD65F03C0 or prev_insn == 0xD503201F:
+                    return offset - func_start
+    
+    return max_search - func_start
 
 
 # Flutter SSL验证函数的特征（不同版本可能不同）
@@ -259,7 +600,7 @@ def patch_ssl_verify(
     """
     Patch SSL验证函数（使其始终返回成功）
     
-    警告：这是一个危险操作，仅用于安全研究！
+    使用 v2 算法定位函数，然后修改指令直接返回 1
     
     Args:
         so_path: SO文件路径
@@ -275,91 +616,67 @@ def patch_ssl_verify(
         return {"success": False, "output_path": "", "patches": [], "error": f"File not found: {so_path}"}
     
     try:
-        binary = lief.parse(so_path)
-        if binary is None:
-            return {"success": False, "output_path": "", "patches": [], "error": "Failed to parse SO file"}
+        # 1. 使用 v2 算法查找函数
+        # print(f"Finding SSL verify function in {so_path}...")
+        find_result = find_ssl_verify_function_v2(so_path)
         
-        patches = []
-        
-        # 查找需要patch的函数
-        target_functions = []
-        for func in binary.exported_functions:
-            name = func.name if hasattr(func, 'name') else str(func)
-            # 查找证书验证相关函数
-            if 'verify' in name.lower() and ('cert' in name.lower() or 'ssl' in name.lower() or 'x509' in name.lower()):
-                target_functions.append({
-                    "name": name,
-                    "address": func.address if hasattr(func, 'address') else 0
-                })
-        
-        if not target_functions:
+        if not find_result["success"]:
             return {
                 "success": False,
                 "output_path": "",
                 "patches": [],
-                "error": "No SSL verify functions found to patch"
+                "error": f"Failed to find target function: {find_result.get('error')}"
             }
         
-        # 读取原始数据
+        func_vaddr = int(find_result["function_address"], 16)
+        func_file_offset = int(find_result["function_file_offset"], 16)
+        
+        # print(f"Target function found at vaddr: 0x{func_vaddr:x} (offset: 0x{func_file_offset:x})")
+        
+        # 2. 准备 Patch 数据
+        # ARM64: MOV W0, #1; RET
+        # 20 00 80 52  MOV W0, #1
+        # C0 03 5F D6  RET
+        patch_code = bytes.fromhex("20008052C0035FD6")
+        
+        # 3. 读取并修改文件
         with open(so_path, 'rb') as f:
             data = bytearray(f.read())
+            
+        # 检查偏移是否有效
+        if func_file_offset + len(patch_code) > len(data):
+            return {"success": False, "output_path": "", "patches": [], "error": "Offset out of bounds"}
+            
+        # 应用 Patch
+        original_bytes = data[func_file_offset:func_file_offset+len(patch_code)]
+        data[func_file_offset:func_file_offset+len(patch_code)] = patch_code
         
-        # 获取架构
-        is_arm64 = False
-        if hasattr(binary, 'header'):
-            arch = binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else ""
-            is_arm64 = "AARCH64" in arch or "ARM64" in arch.upper()
+        patches = [{
+            "vaddr": hex(func_vaddr),
+            "offset": hex(func_file_offset),
+            "original": original_bytes.hex(),
+            "patched": patch_code.hex(),
+            "description": "MOV W0, #1; RET"
+        }]
         
-        # Patch: 让函数直接返回0（成功）
-        # ARM64: mov x0, #0; ret
-        # ARM: mov r0, #0; bx lr
-        if is_arm64:
-            patch_bytes = bytes([0x00, 0x00, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6])  # mov x0, #0; ret
-        else:
-            patch_bytes = bytes([0x00, 0x00, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1])  # mov r0, #0; bx lr
-        
-        # 应用patch
-        for func in target_functions:
-            if func["address"] > 0:
-                # 获取文件偏移
-                offset = func["address"]
-                
-                # 检查偏移是否有效
-                if offset < len(data) - len(patch_bytes):
-                    original = bytes(data[offset:offset + len(patch_bytes)])
-                    data[offset:offset + len(patch_bytes)] = patch_bytes
-                    patches.append({
-                        "function": func["name"],
-                        "address": hex(offset),
-                        "original": original.hex(),
-                        "patched": patch_bytes.hex()
-                    })
-        
-        if not patches:
-            return {
-                "success": False,
-                "output_path": "",
-                "patches": [],
-                "error": "Could not apply patches (invalid addresses)"
-            }
-        
-        # 保存patched文件
-        if output_path is None:
+        # 4. 保存文件
+        if not output_path:
             base, ext = os.path.splitext(so_path)
             output_path = f"{base}_patched{ext}"
-        
+            
         with open(output_path, 'wb') as f:
             f.write(data)
-        
+            
         return {
             "success": True,
             "output_path": output_path,
             "patches": patches,
-            "architecture": "arm64" if is_arm64 else "arm32",
             "error": ""
         }
+        
     except Exception as e:
-        return {"success": False, "output_path": "", "patches": [], "error": str(e)}
+        import traceback
+        return {"success": False, "output_path": "", "patches": [], "error": f"{str(e)}\n{traceback.format_exc()}"}
 
 
 def flutter_patch_apk(

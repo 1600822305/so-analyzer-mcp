@@ -20,12 +20,33 @@ from .flutter_utils import (
     patch_ssl_verify,
     flutter_patch_apk
 )
+from .flutter_utils_v2 import find_ssl_verify_function_v2
 from .patch_utils import (
     patch_bytes,
     search_bytes,
     replace_bytes,
     disassemble,
     get_function_bytes
+)
+from .xref_utils import (
+    get_code_sections,
+    find_string_offset,
+    xref_string,
+    find_function_by_address,
+    analyze_function
+)
+from .advanced_utils import (
+    list_all_functions,
+    callgraph,
+    get_cfg,
+    analyze_function_advanced,
+    detect_string_encryption,
+    trace_register_value
+)
+from .decompile_utils import (
+    check_ghidra,
+    check_radare2,
+    decompile
 )
 
 # 创建MCP服务器
@@ -193,6 +214,17 @@ def get_all_tools() -> list[Tool]:
                 "required": ["apk_path"]
             }
         ),
+        Tool(
+            name="flutter_ssl_offset_v2",
+            description="⭐核心工具！模拟IDA分析流程：1.搜索ssl_client 2.xrefs_to 3.智能选择函数 4.生成脚本",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "libflutter.so文件路径"}
+                },
+                "required": ["so_path"]
+            }
+        ),
         
         # ===== 二进制修改工具 =====
         Tool(
@@ -262,6 +294,168 @@ def get_all_tools() -> list[Tool]:
                     "size": {"type": "integer", "description": "读取字节数（默认64）"}
                 },
                 "required": ["so_path", "function_name"]
+            }
+        ),
+        
+        # ===== 交叉引用分析工具 =====
+        Tool(
+            name="so_xref_string",
+            description="⭐核心工具！查找字符串的交叉引用（哪些代码引用了这个字符串）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "search_string": {"type": "string", "description": "要搜索的字符串"},
+                    "max_xrefs": {"type": "integer", "description": "最多返回的交叉引用数量（默认20）"}
+                },
+                "required": ["so_path", "search_string"]
+            }
+        ),
+        Tool(
+            name="so_find_function",
+            description="根据地址查找所属的函数",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "地址"}
+                },
+                "required": ["so_path", "address"]
+            }
+        ),
+        Tool(
+            name="so_analyze_function",
+            description="分析函数特征，判断是否是SSL验证函数",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "function_address": {"type": "integer", "description": "函数地址"},
+                    "size": {"type": "integer", "description": "分析的字节数（默认256）"}
+                },
+                "required": ["so_path", "function_address"]
+            }
+        ),
+        Tool(
+            name="so_get_sections",
+            description="获取所有代码段信息",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        
+        # ===== 高级分析工具 (新增) =====
+        Tool(
+            name="so_list_all_functions",
+            description="⭐识别所有函数（包括未导出的内部函数），通过扫描函数开头特征识别",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "limit": {"type": "integer", "description": "最大返回数量（默认2000）"},
+                    "search": {"type": "string", "description": "搜索过滤（函数名）"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        Tool(
+            name="so_callgraph",
+            description="⭐分析函数调用关系图，识别BL/BLR调用指令，生成DOT格式调用图",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "max_depth": {"type": "integer", "description": "最大递归深度（默认3）"}
+                },
+                "required": ["so_path", "function_addr"]
+            }
+        ),
+        Tool(
+            name="so_get_cfg",
+            description="⭐生成函数的控制流图(CFG)，识别基本块和分支边，生成DOT格式图",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "max_size": {"type": "integer", "description": "最大分析字节数（默认8192）"}
+                },
+                "required": ["so_path", "function_addr"]
+            }
+        ),
+        Tool(
+            name="so_analyze_function_advanced",
+            description="⭐全面分析函数特征：调用关系、系统调用、字符串引用、复杂度、类型判断(SSL/加密/网络)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "function_address": {"type": "integer", "description": "函数虚拟地址"},
+                    "size": {"type": "integer", "description": "分析的字节数（默认512）"}
+                },
+                "required": ["so_path", "function_address"]
+            }
+        ),
+        Tool(
+            name="so_decompile",
+            description="⭐反编译函数生成伪代码。支持radare2(默认,轻量)/ghidra(高质量)/simple(无依赖)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": "integer", "description": "函数虚拟地址"},
+                    "method": {"type": "string", "description": "反编译方法: radare2(默认)/ghidra/simple"},
+                    "size": {"type": "integer", "description": "分析字节数(simple模式，默认256)"}
+                },
+                "required": ["so_path", "address"]
+            }
+        ),
+        Tool(
+            name="so_check_ghidra",
+            description="检查Ghidra环境是否可用",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="so_check_radare2",
+            description="检查Radare2环境是否可用",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="so_detect_encryption",
+            description="⭐检测字符串加密/混淆：分析熵值、检测XOR/Base64、查找解密函数",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "min_length": {"type": "integer", "description": "最小字符串长度（默认8）"},
+                    "max_strings": {"type": "integer", "description": "最大分析字符串数（默认100）"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        Tool(
+            name="so_trace_register",
+            description="⭐数据流分析：追踪寄存器值的来源，分析参数传递和返回值",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "register": {"type": "string", "description": "目标寄存器（默认x0）"},
+                    "size": {"type": "integer", "description": "分析字节数（默认512）"}
+                },
+                "required": ["so_path", "function_addr"]
             }
         )
     ]
@@ -349,6 +543,9 @@ async def call_tool(name: str, arguments: dict):
                 arch=arguments.get("arch", "arm64-v8a")
             )
         
+        elif name == "flutter_ssl_offset_v2":
+            result = find_ssl_verify_function_v2(so_path=arguments["so_path"])
+        
         # 二进制修改
         elif name == "so_patch_bytes":
             result = patch_bytes(
@@ -387,6 +584,88 @@ async def call_tool(name: str, arguments: dict):
                 so_path=arguments["so_path"],
                 function_name=arguments["function_name"],
                 size=arguments.get("size", 64)
+            )
+        
+        # 交叉引用分析
+        elif name == "so_xref_string":
+            result = xref_string(
+                so_path=arguments["so_path"],
+                search_string=arguments["search_string"],
+                max_xrefs=arguments.get("max_xrefs", 20)
+            )
+        
+        elif name == "so_find_function":
+            result = find_function_by_address(
+                so_path=arguments["so_path"],
+                address=arguments["address"]
+            )
+        
+        elif name == "so_analyze_function":
+            result = analyze_function(
+                so_path=arguments["so_path"],
+                function_address=arguments["function_address"],
+                size=arguments.get("size", 256)
+            )
+        
+        elif name == "so_get_sections":
+            result = get_code_sections(so_path=arguments["so_path"])
+        
+        # 高级分析工具
+        elif name == "so_list_all_functions":
+            result = list_all_functions(
+                so_path=arguments["so_path"],
+                limit=arguments.get("limit", 2000),
+                search=arguments.get("search", "")
+            )
+        
+        elif name == "so_callgraph":
+            result = callgraph(
+                so_path=arguments["so_path"],
+                function_addr=arguments["function_addr"],
+                max_depth=arguments.get("max_depth", 3)
+            )
+        
+        elif name == "so_get_cfg":
+            result = get_cfg(
+                so_path=arguments["so_path"],
+                function_addr=arguments["function_addr"],
+                max_size=arguments.get("max_size", 0x2000)
+            )
+        
+        elif name == "so_analyze_function_advanced":
+            result = analyze_function_advanced(
+                so_path=arguments["so_path"],
+                function_address=arguments["function_address"],
+                size=arguments.get("size", 512)
+            )
+        
+        elif name == "so_decompile":
+            result = decompile(
+                so_path=arguments["so_path"],
+                address=arguments["address"],
+                method=arguments.get("method", "radare2"),
+                size=arguments.get("size", 256)
+            )
+        
+        elif name == "so_check_ghidra":
+            result = check_ghidra()
+        
+        elif name == "so_check_radare2":
+            result = check_radare2()
+        
+        elif name == "so_detect_encryption":
+            result = detect_string_encryption(
+                so_path=arguments["so_path"],
+                min_length=arguments.get("min_length", 8),
+                max_strings=arguments.get("max_strings", 100)
+            )
+        
+        elif name == "so_trace_register":
+            result = trace_register_value(
+                so_path=arguments["so_path"],
+                function_addr=arguments["function_addr"],
+                target_register=arguments.get("register", "x0"),
+                size=arguments.get("size", 512)
             )
         
         else:
