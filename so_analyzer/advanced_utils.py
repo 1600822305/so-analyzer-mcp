@@ -1199,3 +1199,348 @@ def trace_register_value(so_path: str, function_addr: int,
     except Exception as e:
         import traceback
         return {"success": False, "error": f"{str(e)}\n{traceback.format_exc()}"}
+
+
+# ============ 指令模式搜索 ============
+
+# 预定义的常用搜索模式
+COMMON_PATTERNS = {
+    # 系统调用
+    "syscall": {"mnemonic": "svc", "description": "系统调用"},
+    "svc": {"mnemonic": "svc", "description": "系统调用"},
+    
+    # 函数调用
+    "call": {"mnemonic": "bl", "description": "直接函数调用"},
+    "bl": {"mnemonic": "bl", "description": "直接函数调用"},
+    "blr": {"mnemonic": "blr", "description": "间接函数调用(寄存器)"},
+    
+    # 返回
+    "ret": {"mnemonic": "ret", "description": "函数返回"},
+    "return": {"mnemonic": "ret", "description": "函数返回"},
+    
+    # 内存操作
+    "load": {"mnemonic_regex": r"^ld[rbp]?", "description": "加载指令"},
+    "store": {"mnemonic_regex": r"^st[rbp]?", "description": "存储指令"},
+    "ldr": {"mnemonic": "ldr", "description": "加载寄存器"},
+    "str": {"mnemonic": "str", "description": "存储寄存器"},
+    
+    # 比较和分支
+    "compare": {"mnemonic_regex": r"^(cmp|cmn|tst)", "description": "比较指令"},
+    "cmp": {"mnemonic": "cmp", "description": "比较"},
+    "branch": {"mnemonic_regex": r"^b\.", "description": "条件分支"},
+    "cbz": {"mnemonic": "cbz", "description": "为零跳转"},
+    "cbnz": {"mnemonic": "cbnz", "description": "非零跳转"},
+    
+    # 算术运算
+    "add": {"mnemonic": "add", "description": "加法"},
+    "sub": {"mnemonic": "sub", "description": "减法"},
+    "mul": {"mnemonic": "mul", "description": "乘法"},
+    
+    # 逻辑运算
+    "and": {"mnemonic": "and", "description": "与操作"},
+    "or": {"mnemonic_regex": r"^orr?", "description": "或操作"},
+    "xor": {"mnemonic": "eor", "description": "异或操作"},
+    "eor": {"mnemonic": "eor", "description": "异或操作"},
+    
+    # 移位
+    "shift": {"mnemonic_regex": r"^(lsl|lsr|asr|ror)", "description": "移位操作"},
+    
+    # 加密相关模式
+    "aes": {"mnemonic_regex": r"^aes", "description": "AES加密指令"},
+    "sha": {"mnemonic_regex": r"^sha", "description": "SHA哈希指令"},
+    
+    # SIMD/NEON
+    "neon": {"mnemonic_regex": r"^(ld[1-4]|st[1-4]|fmla|fmul|fadd)", "description": "NEON/SIMD指令"},
+}
+
+
+def find_instruction_pattern(so_path: str, pattern: str, 
+                             operand_filter: str = "",
+                             limit: int = 100,
+                             section: str = ".text") -> dict:
+    """
+    搜索指令模式
+    
+    支持的模式格式:
+    1. 简单指令名: "bl", "svc", "ret"
+    2. 预定义模式: "syscall", "call", "compare", "xor"
+    3. 正则表达式: "b\\..*" (条件分支), "ld[rbp].*" (加载指令)
+    4. 指令序列: "stp;mov;bl" (用分号分隔)
+    5. 带操作数过滤: pattern="bl", operand_filter="#0x" (调用特定范围)
+    
+    Args:
+        so_path: SO文件路径
+        pattern: 搜索模式
+        operand_filter: 操作数过滤（可选，支持正则）
+        limit: 最大返回数量
+        section: 搜索的段（默认.text）
+    
+    Returns:
+        dict: {
+            "success": bool,
+            "matches": [{address, mnemonic, operands, context}],
+            "count": int,
+            "pattern_info": str
+        }
+    """
+    import re
+    
+    if not LIEF_AVAILABLE:
+        return {"success": False, "error": "lief not available"}
+    
+    if not CAPSTONE_AVAILABLE:
+        return {"success": False, "error": "capstone not available"}
+    
+    if not os.path.exists(so_path):
+        return {"success": False, "error": f"File not found: {so_path}"}
+    
+    try:
+        binary = lief.parse(so_path)
+        if binary is None:
+            return {"success": False, "error": "Failed to parse binary"}
+        
+        # 查找目标段
+        target_section = None
+        for sec in binary.sections:
+            if sec.name == section:
+                target_section = sec
+                break
+        
+        if not target_section:
+            # 尝试使用 .text 或可执行段
+            for sec in binary.sections:
+                if sec.has_characteristic(lief.ELF.Section.FLAGS.EXECINSTR):
+                    target_section = sec
+                    break
+        
+        if not target_section:
+            return {"success": False, "error": f"Section {section} not found"}
+        
+        # 获取段数据
+        section_data = bytes(target_section.content)
+        section_vaddr = target_section.virtual_address
+        
+        # 初始化反汇编器
+        md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+        md.detail = True
+        
+        # 解析搜索模式
+        pattern_info = ""
+        patterns_to_match = []
+        is_sequence = ";" in pattern
+        
+        if is_sequence:
+            # 指令序列搜索
+            seq_parts = [p.strip().lower() for p in pattern.split(";") if p.strip()]
+            patterns_to_match = seq_parts
+            pattern_info = f"Instruction sequence: {' -> '.join(seq_parts)}"
+        elif pattern.lower() in COMMON_PATTERNS:
+            # 预定义模式
+            preset = COMMON_PATTERNS[pattern.lower()]
+            if "mnemonic" in preset:
+                patterns_to_match = [{"type": "exact", "value": preset["mnemonic"]}]
+            elif "mnemonic_regex" in preset:
+                patterns_to_match = [{"type": "regex", "value": preset["mnemonic_regex"]}]
+            pattern_info = f"Preset pattern: {preset['description']}"
+        else:
+            # 自定义模式（可能是正则）
+            if any(c in pattern for c in r".*+?[](){}|^$\\"):
+                patterns_to_match = [{"type": "regex", "value": pattern}]
+                pattern_info = f"Regex pattern: {pattern}"
+            else:
+                patterns_to_match = [{"type": "exact", "value": pattern.lower()}]
+                pattern_info = f"Exact match: {pattern}"
+        
+        # 编译操作数过滤正则
+        operand_regex = None
+        if operand_filter:
+            try:
+                operand_regex = re.compile(operand_filter, re.IGNORECASE)
+            except:
+                operand_regex = re.compile(re.escape(operand_filter), re.IGNORECASE)
+        
+        # 反汇编整个段
+        instructions = list(md.disasm(section_data, section_vaddr))
+        
+        matches = []
+        
+        if is_sequence:
+            # 序列匹配
+            seq_len = len(patterns_to_match)
+            i = 0
+            while i < len(instructions) - seq_len + 1 and len(matches) < limit:
+                match = True
+                matched_insns = []
+                
+                for j, pattern_item in enumerate(patterns_to_match):
+                    insn = instructions[i + j]
+                    mnem = insn.mnemonic.lower()
+                    
+                    if isinstance(pattern_item, str):
+                        # 简单字符串匹配
+                        if pattern_item not in mnem and not re.match(pattern_item, mnem):
+                            match = False
+                            break
+                    matched_insns.append(insn)
+                
+                if match:
+                    # 检查操作数过滤
+                    if operand_regex:
+                        ops_str = " ".join(ins.op_str for ins in matched_insns)
+                        if not operand_regex.search(ops_str):
+                            i += 1
+                            continue
+                    
+                    # 获取上下文
+                    context_before = []
+                    context_after = []
+                    
+                    for k in range(max(0, i-2), i):
+                        ctx_insn = instructions[k]
+                        context_before.append({
+                            "address": hex(ctx_insn.address),
+                            "instruction": f"{ctx_insn.mnemonic} {ctx_insn.op_str}"
+                        })
+                    
+                    for k in range(i + seq_len, min(len(instructions), i + seq_len + 2)):
+                        ctx_insn = instructions[k]
+                        context_after.append({
+                            "address": hex(ctx_insn.address),
+                            "instruction": f"{ctx_insn.mnemonic} {ctx_insn.op_str}"
+                        })
+                    
+                    matches.append({
+                        "address": hex(matched_insns[0].address),
+                        "file_offset": hex(matched_insns[0].address - section_vaddr + target_section.offset),
+                        "sequence": [
+                            {
+                                "address": hex(ins.address),
+                                "mnemonic": ins.mnemonic,
+                                "operands": ins.op_str
+                            }
+                            for ins in matched_insns
+                        ],
+                        "context_before": context_before,
+                        "context_after": context_after
+                    })
+                    i += seq_len  # 跳过匹配的序列
+                else:
+                    i += 1
+        else:
+            # 单指令匹配
+            for i, insn in enumerate(instructions):
+                if len(matches) >= limit:
+                    break
+                
+                mnem = insn.mnemonic.lower()
+                matched = False
+                
+                for pattern_item in patterns_to_match:
+                    if isinstance(pattern_item, dict):
+                        if pattern_item["type"] == "exact":
+                            matched = mnem == pattern_item["value"]
+                        elif pattern_item["type"] == "regex":
+                            matched = bool(re.match(pattern_item["value"], mnem, re.IGNORECASE))
+                    else:
+                        matched = mnem == pattern_item.lower()
+                    
+                    if matched:
+                        break
+                
+                if not matched:
+                    continue
+                
+                # 检查操作数过滤
+                if operand_regex and not operand_regex.search(insn.op_str):
+                    continue
+                
+                # 获取上下文
+                context_before = []
+                context_after = []
+                
+                for k in range(max(0, i-3), i):
+                    ctx_insn = instructions[k]
+                    context_before.append({
+                        "address": hex(ctx_insn.address),
+                        "instruction": f"{ctx_insn.mnemonic} {ctx_insn.op_str}"
+                    })
+                
+                for k in range(i+1, min(len(instructions), i+4)):
+                    ctx_insn = instructions[k]
+                    context_after.append({
+                        "address": hex(ctx_insn.address),
+                        "instruction": f"{ctx_insn.mnemonic} {ctx_insn.op_str}"
+                    })
+                
+                # 解析特殊信息
+                extra_info = {}
+                
+                # 对于 BL 指令，解析目标地址
+                if mnem == "bl":
+                    try:
+                        parts = insn.op_str.split("#")
+                        if len(parts) > 1:
+                            target_addr = int(parts[1].strip(), 16)
+                            extra_info["target_address"] = hex(target_addr)
+                            # 尝试找到目标函数名
+                            for sym in binary.exported_symbols:
+                                if sym.value == target_addr:
+                                    extra_info["target_name"] = sym.name
+                                    break
+                    except:
+                        pass
+                
+                # 对于 SVC 指令，解析系统调用号
+                if mnem == "svc":
+                    try:
+                        parts = insn.op_str.split("#")
+                        if len(parts) > 1:
+                            syscall_num = int(parts[1].strip(), 16)
+                            extra_info["syscall_number"] = syscall_num
+                            # 常见 ARM64 Linux 系统调用
+                            SYSCALL_NAMES = {
+                                0: "io_setup", 56: "openat", 57: "close",
+                                63: "read", 64: "write", 78: "readlinkat",
+                                93: "exit", 94: "exit_group",
+                                172: "getpid", 220: "clone", 221: "execve",
+                                226: "mprotect", 278: "getrandom"
+                            }
+                            if syscall_num in SYSCALL_NAMES:
+                                extra_info["syscall_name"] = SYSCALL_NAMES[syscall_num]
+                    except:
+                        pass
+                
+                matches.append({
+                    "address": hex(insn.address),
+                    "file_offset": hex(insn.address - section_vaddr + target_section.offset),
+                    "mnemonic": insn.mnemonic,
+                    "operands": insn.op_str,
+                    "bytes": insn.bytes.hex(),
+                    "context_before": context_before,
+                    "context_after": context_after,
+                    **extra_info
+                })
+        
+        # 统计信息
+        stats = {
+            "total_instructions": len(instructions),
+            "section_size": len(section_data),
+            "section_start": hex(section_vaddr)
+        }
+        
+        return {
+            "success": True,
+            "pattern": pattern,
+            "pattern_info": pattern_info,
+            "operand_filter": operand_filter if operand_filter else None,
+            "matches": matches,
+            "count": len(matches),
+            "truncated": len(matches) >= limit,
+            "stats": stats,
+            "available_presets": list(COMMON_PATTERNS.keys()),
+            "error": ""
+        }
+    
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": f"{str(e)}\n{traceback.format_exc()}"}

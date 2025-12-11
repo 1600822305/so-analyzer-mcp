@@ -41,7 +41,8 @@ from .advanced_utils import (
     get_cfg,
     analyze_function_advanced,
     detect_string_encryption,
-    trace_register_value
+    trace_register_value,
+    find_instruction_pattern
 )
 from .decompile_utils import (
     check_ghidra,
@@ -457,6 +458,20 @@ def get_all_tools() -> list[Tool]:
                 },
                 "required": ["so_path", "function_addr"]
             }
+        ),
+        Tool(
+            name="so_find_instruction",
+            description="⭐搜索指令模式。支持:简单指令(bl/svc/ret)、预定义模式(syscall/compare/xor)、正则表达式、指令序列(stp;mov;bl)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "pattern": {"type": "string", "description": "搜索模式：指令名/预定义/正则/序列(分号分隔)"},
+                    "operand_filter": {"type": "string", "description": "操作数过滤（可选，支持正则）"},
+                    "limit": {"type": "integer", "description": "最大返回数量（默认100）"}
+                },
+                "required": ["so_path", "pattern"]
+            }
         )
     ]
 
@@ -666,6 +681,14 @@ async def call_tool(name: str, arguments: dict):
                 function_addr=arguments["function_addr"],
                 target_register=arguments.get("register", "x0"),
                 size=arguments.get("size", 512)
+            )
+        
+        elif name == "so_find_instruction":
+            result = find_instruction_pattern(
+                so_path=arguments["so_path"],
+                pattern=arguments["pattern"],
+                operand_filter=arguments.get("operand_filter", ""),
+                limit=arguments.get("limit", 100)
             )
         
         else:
