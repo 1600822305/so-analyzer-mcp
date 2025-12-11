@@ -66,6 +66,14 @@ from .flutter_libapp import (
     analyze_flutter_apk,
     find_flutter_vip_functions
 )
+from .blutter_parser import (
+    parse_blutter_output,
+    search_blutter_vip_functions,
+    search_blutter_functions,
+    search_blutter_strings,
+    get_function_detail,
+    export_frida_hooks
+)
 
 # 创建MCP服务器
 server = Server("so-analyzer")
@@ -640,6 +648,82 @@ def get_all_tools() -> list[Tool]:
                 },
                 "required": ["libapp_path"]
             }
+        ),
+        
+        # ===== Blutter输出解析 =====
+        Tool(
+            name="blutter_parse",
+            description="⭐解析Blutter输出目录，获取包、函数、类、字符串等完整信息",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录路径"}
+                },
+                "required": ["blutter_dir"]
+            }
+        ),
+        Tool(
+            name="blutter_search_vip",
+            description="⭐在Blutter输出中搜索VIP/会员相关函数，自动生成修改建议",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录"},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "自定义关键词（可选）"}
+                },
+                "required": ["blutter_dir"]
+            }
+        ),
+        Tool(
+            name="blutter_search_func",
+            description="搜索Blutter解析出的函数。类型:name/address/package/class",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录"},
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "search_type": {"type": "string", "description": "搜索类型:name/address/package/class"}
+                },
+                "required": ["blutter_dir", "query"]
+            }
+        ),
+        Tool(
+            name="blutter_search_string",
+            description="搜索Blutter解析出的字符串（从pp.txt）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录"},
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "case_sensitive": {"type": "boolean", "description": "是否区分大小写（默认false）"}
+                },
+                "required": ["blutter_dir", "query"]
+            }
+        ),
+        Tool(
+            name="blutter_func_detail",
+            description="获取指定地址函数的详细信息和汇编代码",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录"},
+                    "address": {"type": "string", "description": "函数地址（如0xa716a8）"}
+                },
+                "required": ["blutter_dir", "address"]
+            }
+        ),
+        Tool(
+            name="blutter_export_hooks",
+            description="为指定函数生成Frida Hook脚本。类型:trace/modify/log",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "blutter_dir": {"type": "string", "description": "Blutter输出目录"},
+                    "functions": {"type": "array", "description": "函数列表[{address,name},...]"},
+                    "hook_type": {"type": "string", "description": "Hook类型:trace/modify/log"}
+                },
+                "required": ["blutter_dir", "functions"]
+            }
         )
     ]
 
@@ -936,6 +1020,45 @@ async def call_tool(name: str, arguments: dict):
             result = find_flutter_vip_functions(
                 libapp_path=arguments["libapp_path"],
                 blutter_output_dir=arguments.get("blutter_output_dir")
+            )
+        
+        # Blutter输出解析
+        elif name == "blutter_parse":
+            result = parse_blutter_output(
+                blutter_dir=arguments["blutter_dir"]
+            )
+        
+        elif name == "blutter_search_vip":
+            result = search_blutter_vip_functions(
+                blutter_dir=arguments["blutter_dir"],
+                custom_keywords=arguments.get("keywords")
+            )
+        
+        elif name == "blutter_search_func":
+            result = search_blutter_functions(
+                blutter_dir=arguments["blutter_dir"],
+                query=arguments["query"],
+                search_type=arguments.get("search_type", "name")
+            )
+        
+        elif name == "blutter_search_string":
+            result = search_blutter_strings(
+                blutter_dir=arguments["blutter_dir"],
+                query=arguments["query"],
+                case_sensitive=arguments.get("case_sensitive", False)
+            )
+        
+        elif name == "blutter_func_detail":
+            result = get_function_detail(
+                blutter_dir=arguments["blutter_dir"],
+                address=arguments["address"]
+            )
+        
+        elif name == "blutter_export_hooks":
+            result = export_frida_hooks(
+                blutter_dir=arguments["blutter_dir"],
+                functions=arguments["functions"],
+                hook_type=arguments.get("hook_type", "trace")
             )
         
         else:

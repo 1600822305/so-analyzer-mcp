@@ -18,7 +18,7 @@ except ImportError:
 # ==================== 配置 ====================
 
 # Blutter 路径（可通过环境变量设置）
-BLUTTER_PATH = os.environ.get("BLUTTER_PATH", "")
+BLUTTER_PATH = os.environ.get("BLUTTER_PATH", r"K:\Cherry\androidmtmangebg\blutter")
 
 # Darter 是否可用
 try:
@@ -365,7 +365,7 @@ def extract_dart_symbols(libapp_path: str) -> dict:
                 results["interesting_strings"].append(s)
         
         # 限制数量
-        for key in results:
+        for key in list(results.keys()):
             if isinstance(results[key], list) and len(results[key]) > 100:
                 results[key] = results[key][:100]
                 results[f"{key}_truncated"] = True
