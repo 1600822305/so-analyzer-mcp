@@ -273,7 +273,7 @@ def get_imports(so_path: str, search: str = "", limit: int = 100) -> dict:
 
 def get_strings(so_path: str, min_length: int = 4, search: str = "", limit: int = 200) -> dict:
     """
-    提取SO文件中的字符串
+    提取SO文件中的字符串（IDA级功能 - 返回地址和长度）
     
     Args:
         so_path: SO文件路径
@@ -282,7 +282,7 @@ def get_strings(so_path: str, min_length: int = 4, search: str = "", limit: int 
         limit: 最多返回数量
     
     Returns:
-        dict: {"success": bool, "strings": list, "error": str}
+        dict: {"success": bool, "strings": list[{address, length, string}], "error": str}
     """
     if not os.path.exists(so_path):
         return {"success": False, "strings": [], "error": f"File not found: {so_path}"}
@@ -292,23 +292,58 @@ def get_strings(so_path: str, min_length: int = 4, search: str = "", limit: int 
         with open(so_path, 'rb') as f:
             data = f.read()
         
-        # 提取ASCII字符串
+        # 解析ELF获取虚拟地址映射
+        binary = None
+        section_map = []  # [(file_start, file_end, vaddr_base)]
+        if LIEF_AVAILABLE:
+            binary = lief.parse(so_path)
+            if binary:
+                for section in binary.sections:
+                    if section.size > 0:
+                        section_map.append((
+                            section.file_offset,
+                            section.file_offset + section.size,
+                            section.virtual_address
+                        ))
+        
+        def file_offset_to_vaddr(offset: int) -> int:
+            """将文件偏移转换为虚拟地址"""
+            for start, end, vaddr_base in section_map:
+                if start <= offset < end:
+                    return vaddr_base + (offset - start)
+            return offset  # 无法映射时返回文件偏移
+        
+        # 提取ASCII字符串（带地址）
         current = []
-        for byte in data:
+        string_start = 0
+        
+        for i, byte in enumerate(data):
             if 32 <= byte < 127:  # 可打印ASCII
+                if not current:
+                    string_start = i
                 current.append(chr(byte))
             else:
                 if len(current) >= min_length:
                     s = ''.join(current)
                     if not search or search.lower() in s.lower():
-                        strings.append(s)
+                        vaddr = file_offset_to_vaddr(string_start)
+                        strings.append({
+                            "address": hex(vaddr),
+                            "length": len(s),
+                            "string": s
+                        })
                 current = []
         
         # 处理最后一个字符串
         if len(current) >= min_length:
             s = ''.join(current)
             if not search or search.lower() in s.lower():
-                strings.append(s)
+                vaddr = file_offset_to_vaddr(string_start)
+                strings.append({
+                    "address": hex(vaddr),
+                    "length": len(s),
+                    "string": s
+                })
         
         total = len(strings)
         

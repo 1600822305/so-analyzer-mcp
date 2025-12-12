@@ -189,6 +189,25 @@ def replace_bytes(
         return {"success": False, "replaced_count": 0, "error": str(e)}
 
 
+def vaddr_to_file_offset(binary, vaddr: int) -> int:
+    """
+    将虚拟地址转换为文件偏移
+    
+    Args:
+        binary: LIEF解析的二进制对象
+        vaddr: 虚拟地址
+    
+    Returns:
+        int: 文件偏移，找不到返回-1
+    """
+    for segment in binary.segments:
+        if segment.virtual_address <= vaddr < segment.virtual_address + segment.virtual_size:
+            offset_in_segment = vaddr - segment.virtual_address
+            if offset_in_segment < segment.physical_size:
+                return segment.file_offset + offset_in_segment
+    return -1
+
+
 def disassemble(
     so_path: str,
     address: int,
@@ -200,7 +219,7 @@ def disassemble(
     
     Args:
         so_path: SO文件路径
-        address: 起始地址（文件偏移）
+        address: 起始地址（虚拟地址，兼容IDA风格）
         size: 字节数
         arch: 架构（auto/arm64/arm）
     
@@ -221,19 +240,42 @@ def disassemble(
         with open(so_path, 'rb') as f:
             data = f.read()
         
-        # 自动检测架构
-        if arch == "auto":
-            if LIEF_AVAILABLE:
-                binary = lief.parse(so_path)
-                if binary and hasattr(binary, 'header'):
-                    arch_name = binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else ""
-                    if "AARCH64" in arch_name or "ARM64" in arch_name.upper():
-                        arch = "arm64"
-                    else:
-                        arch = "arm"
+        binary = None
+        file_offset = address  # 默认当作文件偏移
+        virtual_addr = address  # 用于反汇编输出
+        
+        # 自动检测架构并解析ELF
+        if LIEF_AVAILABLE:
+            binary = lief.parse(so_path)
+            if binary and hasattr(binary, 'header'):
+                arch_name = binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else ""
+                if "AARCH64" in arch_name or "ARM64" in arch_name.upper():
+                    arch = "arm64" if arch == "auto" else arch
+                elif arch == "auto":
+                    arch = "arm"
+                
+                # 判断address是虚拟地址还是文件偏移
+                # 通常虚拟地址 > 0x10000 且在某个段范围内
+                converted_offset = vaddr_to_file_offset(binary, address)
+                if converted_offset >= 0:
+                    # address是有效的虚拟地址
+                    file_offset = converted_offset
+                    virtual_addr = address
                 else:
-                    arch = "arm64"  # 默认
+                    # 可能已经是文件偏移，或者是无效地址
+                    # 尝试当作文件偏移使用
+                    file_offset = address
+                    # 计算对应的虚拟地址（用于反汇编输出）
+                    for segment in binary.segments:
+                        if segment.file_offset <= address < segment.file_offset + segment.physical_size:
+                            offset_in_segment = address - segment.file_offset
+                            virtual_addr = segment.virtual_address + offset_in_segment
+                            break
             else:
+                if arch == "auto":
+                    arch = "arm64"
+        else:
+            if arch == "auto":
                 arch = "arm64"
         
         # 配置反汇编器
@@ -242,16 +284,16 @@ def disassemble(
         else:
             md = Cs(CS_ARCH_ARM, CS_MODE_ARM + CS_MODE_THUMB)
         
-        # 提取代码
-        if address < 0 or address + size > len(data):
-            return {"success": False, "instructions": [], "error": f"Invalid address range: {address} + {size} > {len(data)}"}
+        # 提取代码（使用文件偏移）
+        if file_offset < 0 or file_offset + size > len(data):
+            return {"success": False, "instructions": [], "error": f"Invalid address range: file_offset={hex(file_offset)}, size={size}, file_size={len(data)}"}
         
-        code = bytes(data[address:address + size])
+        code = bytes(data[file_offset:file_offset + size])
         
-        # 反汇编
+        # 反汇编（使用虚拟地址作为起始地址）
         instructions = []
         try:
-            for insn in md.disasm(code, address):
+            for insn in md.disasm(code, virtual_addr):
                 instructions.append({
                     "address": hex(insn.address),
                     "bytes": insn.bytes.hex(),
@@ -287,7 +329,8 @@ def disassemble(
             "instructions": instructions,
             "count": len(instructions),
             "architecture": arch,
-            "start_address": hex(address),
+            "start_address": hex(virtual_addr),
+            "file_offset": hex(file_offset),
             "error": ""
         }
     except Exception as e:

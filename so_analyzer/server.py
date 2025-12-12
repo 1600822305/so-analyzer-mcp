@@ -3,6 +3,27 @@ import json
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+
+def parse_address(addr) -> int:
+    """
+    解析地址参数，支持多种格式：
+    - 整数: 7192340
+    - 十六进制字符串: "0x6DBD94" 或 "6DBD94"
+    """
+    if isinstance(addr, int):
+        return addr
+    if isinstance(addr, str):
+        addr = addr.strip()
+        try:
+            return int(addr, 0)  # 自动检测进制
+        except ValueError:
+            # 尝试作为纯十六进制（无0x前缀）
+            try:
+                return int(addr, 16)
+            except ValueError:
+                raise ValueError(f"无法解析地址: {addr}")
+    raise ValueError(f"无效的地址类型: {type(addr)}")
+
 from .so_utils import (
     check_lief,
     list_libs_from_apk,
@@ -43,6 +64,16 @@ from .advanced_utils import (
     detect_string_encryption,
     trace_register_value,
     find_instruction_pattern
+)
+from .elf_utils import (
+    get_entrypoints,
+    list_globals
+)
+from .xref_enhanced import (
+    xref_string_enhanced,
+    get_callers,
+    get_callees,
+    find_function_at
 )
 from .decompile_utils import (
     check_ghidra,
@@ -302,7 +333,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "起始地址"},
+                    "address": {"type": ["integer", "string"], "description": "起始地址(支持0x十六进制)"},
                     "size": {"type": "integer", "description": "字节数（默认64）"},
                     "arch": {"type": "string", "description": "架构（auto/arm64/arm）"}
                 },
@@ -325,26 +356,13 @@ def get_all_tools() -> list[Tool]:
         
         # ===== 交叉引用分析工具 =====
         Tool(
-            name="so_xref_string",
-            description="⭐核心工具！查找字符串的交叉引用（哪些代码引用了这个字符串）",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "so_path": {"type": "string", "description": "SO文件路径"},
-                    "search_string": {"type": "string", "description": "要搜索的字符串"},
-                    "max_xrefs": {"type": "integer", "description": "最多返回的交叉引用数量（默认20）"}
-                },
-                "required": ["so_path", "search_string"]
-            }
-        ),
-        Tool(
             name="so_find_function",
             description="根据地址查找所属的函数",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "地址"}
+                    "address": {"type": ["integer", "string"], "description": "地址(支持0x十六进制)"}
                 },
                 "required": ["so_path", "address"]
             }
@@ -356,7 +374,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "function_address": {"type": "integer", "description": "函数地址"},
+                    "function_address": {"type": ["integer", "string"], "description": "函数地址(支持0x十六进制)"},
                     "size": {"type": "integer", "description": "分析的字节数（默认256）"}
                 },
                 "required": ["so_path", "function_address"]
@@ -395,7 +413,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "function_addr": {"type": ["integer", "string"], "description": "函数虚拟地址(支持0x十六进制)"},
                     "max_depth": {"type": "integer", "description": "最大递归深度（默认3）"}
                 },
                 "required": ["so_path", "function_addr"]
@@ -408,7 +426,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "function_addr": {"type": ["integer", "string"], "description": "函数虚拟地址(支持0x十六进制)"},
                     "max_size": {"type": "integer", "description": "最大分析字节数（默认8192）"}
                 },
                 "required": ["so_path", "function_addr"]
@@ -421,7 +439,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "function_address": {"type": "integer", "description": "函数虚拟地址"},
+                    "function_address": {"type": ["integer", "string"], "description": "函数虚拟地址(支持0x十六进制)"},
                     "size": {"type": "integer", "description": "分析的字节数（默认512）"}
                 },
                 "required": ["so_path", "function_address"]
@@ -434,7 +452,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "函数虚拟地址"},
+                    "address": {"type": ["integer", "string"], "description": "函数虚拟地址(支持0x十六进制)"},
                     "method": {"type": "string", "description": "反编译方法: radare2(默认)/ghidra/simple"},
                     "size": {"type": "integer", "description": "分析字节数(simple模式，默认256)"}
                 },
@@ -477,7 +495,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "function_addr": {"type": "integer", "description": "函数虚拟地址"},
+                    "function_addr": {"type": ["integer", "string"], "description": "函数虚拟地址(支持0x十六进制)"},
                     "register": {"type": "string", "description": "目标寄存器（默认x0）"},
                     "size": {"type": "integer", "description": "分析字节数（默认512）"}
                 },
@@ -498,6 +516,83 @@ def get_all_tools() -> list[Tool]:
                 "required": ["so_path", "pattern"]
             }
         ),
+        Tool(
+            name="so_get_entrypoints",
+            description="⭐获取SO文件所有入口点：ELF入口、_init/_fini、构造/析构函数、JNI_OnLoad等",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        Tool(
+            name="so_list_globals",
+            description="⭐列出全局变量：.data/.bss/.rodata/.got段中的数据，显示名称、地址、大小、值预览",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "search": {"type": "string", "description": "搜索过滤（名称或地址）"},
+                    "limit": {"type": "integer", "description": "最大返回数量（默认500）"},
+                    "include_rodata": {"type": "boolean", "description": "是否包含只读数据（默认true）"},
+                    "min_size": {"type": "integer", "description": "最小变量大小过滤"}
+                },
+                "required": ["so_path"]
+            }
+        ),
+        Tool(
+            name="so_xref_string",
+            description="⭐核心工具！查找字符串交叉引用 - 返回函数上下文（IDA级功能）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "search_string": {"type": "string", "description": "要搜索的字符串"},
+                    "max_xrefs": {"type": "integer", "description": "最大返回数量（默认20）"}
+                },
+                "required": ["so_path", "search_string"]
+            }
+        ),
+        Tool(
+            name="so_callers",
+            description="⭐获取调用指定函数的所有位置（IDA callers功能）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "func_address": {"type": "integer", "description": "目标函数地址"},
+                    "limit": {"type": "integer", "description": "最大返回数量（默认50）"}
+                },
+                "required": ["so_path", "func_address"]
+            }
+        ),
+        Tool(
+            name="so_callees",
+            description="⭐获取函数调用的所有函数（IDA callees功能）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "func_address": {"type": "integer", "description": "函数起始地址"},
+                    "func_size": {"type": "integer", "description": "函数大小（可选，默认自动检测）"}
+                },
+                "required": ["so_path", "func_address"]
+            }
+        ),
+        Tool(
+            name="so_find_function_v2",
+            description="⭐改进版函数查找 - 修复边界检测问题",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "so_path": {"type": "string", "description": "SO文件路径"},
+                    "address": {"type": ["integer", "string"], "description": "目标地址(支持0x十六进制)"}
+                },
+                "required": ["so_path", "address"]
+            }
+        ),
         
         # ===== 高级Patch工具 =====
         Tool(
@@ -507,7 +602,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "函数地址（虚拟地址）"},
+                    "address": {"type": ["integer", "string"], "description": "函数地址(支持0x十六进制)"},
                     "return_value": {"type": ["integer", "string"], "description": "返回值:0/1/true/false/-1/max/数字"},
                     "output_path": {"type": "string", "description": "输出路径（可选，默认覆盖原文件）"}
                 },
@@ -521,7 +616,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "起始地址（虚拟地址）"},
+                    "address": {"type": ["integer", "string"], "description": "起始地址(支持0x十六进制)"},
                     "count": {"type": "integer", "description": "NOP数量（每个4字节，默认1）"},
                     "output_path": {"type": "string", "description": "输出路径（可选）"}
                 },
@@ -535,7 +630,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "分支指令地址"},
+                    "address": {"type": ["integer", "string"], "description": "分支指令地址(支持0x十六进制)"},
                     "patch_type": {"type": "string", "description": "类型:force_jump/no_jump/invert"},
                     "output_path": {"type": "string", "description": "输出路径（可选）"}
                 },
@@ -549,7 +644,7 @@ def get_all_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "so_path": {"type": "string", "description": "SO文件路径"},
-                    "address": {"type": "integer", "description": "目标地址"},
+                    "address": {"type": ["integer", "string"], "description": "目标地址(支持0x十六进制)"},
                     "hex_bytes": {"type": "string", "description": "十六进制字节(如20008052C0035FD6)"},
                     "output_path": {"type": "string", "description": "输出路径（可选）"}
                 },
@@ -841,7 +936,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_disassemble":
             result = disassemble(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 size=arguments.get("size", 64),
                 arch=arguments.get("arch", "auto")
             )
@@ -855,7 +950,7 @@ async def call_tool(name: str, arguments: dict):
         
         # 交叉引用分析
         elif name == "so_xref_string":
-            result = xref_string(
+            result = xref_string_enhanced(
                 so_path=arguments["so_path"],
                 search_string=arguments["search_string"],
                 max_xrefs=arguments.get("max_xrefs", 20)
@@ -864,13 +959,13 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_find_function":
             result = find_function_by_address(
                 so_path=arguments["so_path"],
-                address=arguments["address"]
+                address=parse_address(arguments["address"])
             )
         
         elif name == "so_analyze_function":
             result = analyze_function(
                 so_path=arguments["so_path"],
-                function_address=arguments["function_address"],
+                function_address=parse_address(arguments["function_address"]),
                 size=arguments.get("size", 256)
             )
         
@@ -888,28 +983,28 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_callgraph":
             result = callgraph(
                 so_path=arguments["so_path"],
-                function_addr=arguments["function_addr"],
+                function_addr=parse_address(arguments["function_addr"]),
                 max_depth=arguments.get("max_depth", 3)
             )
         
         elif name == "so_get_cfg":
             result = get_cfg(
                 so_path=arguments["so_path"],
-                function_addr=arguments["function_addr"],
+                function_addr=parse_address(arguments["function_addr"]),
                 max_size=arguments.get("max_size", 0x2000)
             )
         
         elif name == "so_analyze_function_advanced":
             result = analyze_function_advanced(
                 so_path=arguments["so_path"],
-                function_address=arguments["function_address"],
+                function_address=parse_address(arguments["function_address"]),
                 size=arguments.get("size", 512)
             )
         
         elif name == "so_decompile":
             result = decompile(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 method=arguments.get("method", "radare2"),
                 size=arguments.get("size", 256)
             )
@@ -930,7 +1025,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_trace_register":
             result = trace_register_value(
                 so_path=arguments["so_path"],
-                function_addr=arguments["function_addr"],
+                function_addr=parse_address(arguments["function_addr"]),
                 target_register=arguments.get("register", "x0"),
                 size=arguments.get("size", 512)
             )
@@ -943,11 +1038,43 @@ async def call_tool(name: str, arguments: dict):
                 limit=arguments.get("limit", 100)
             )
         
+        elif name == "so_get_entrypoints":
+            result = get_entrypoints(so_path=arguments["so_path"])
+        
+        elif name == "so_list_globals":
+            result = list_globals(
+                so_path=arguments["so_path"],
+                search=arguments.get("search", ""),
+                limit=arguments.get("limit", 500),
+                include_rodata=arguments.get("include_rodata", True),
+                min_size=arguments.get("min_size", 0)
+            )
+        
+        elif name == "so_callers":
+            result = get_callers(
+                so_path=arguments["so_path"],
+                func_address=parse_address(arguments["func_address"]),
+                limit=arguments.get("limit", 50)
+            )
+        
+        elif name == "so_callees":
+            result = get_callees(
+                so_path=arguments["so_path"],
+                func_address=parse_address(arguments["func_address"]),
+                func_size=arguments.get("func_size", 0x1000)
+            )
+        
+        elif name == "so_find_function_v2":
+            result = find_function_at(
+                so_path=arguments["so_path"],
+                address=parse_address(arguments["address"])
+            )
+        
         # 高级Patch工具
         elif name == "so_patch_return":
             result = patch_return_value(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 return_value=arguments.get("return_value", 1),
                 output_path=arguments.get("output_path")
             )
@@ -955,7 +1082,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_patch_nop":
             result = patch_nop(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 count=arguments.get("count", 1),
                 output_path=arguments.get("output_path")
             )
@@ -963,7 +1090,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_patch_branch":
             result = patch_branch(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 patch_type=arguments["patch_type"],
                 output_path=arguments.get("output_path")
             )
@@ -971,7 +1098,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "so_patch_hex":
             result = patch_custom(
                 so_path=arguments["so_path"],
-                address=arguments["address"],
+                address=parse_address(arguments["address"]),
                 hex_bytes=arguments["hex_bytes"],
                 output_path=arguments.get("output_path")
             )
